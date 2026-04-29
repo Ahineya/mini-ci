@@ -82,6 +82,8 @@ async fn main() -> anyhow::Result<()> {
     let api = Router::new()
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).delete(delete_project))
+        .route("/projects/{id}/repo/status", get(repo_status))
+        .route("/projects/{id}/repo/init/stream", get(repo_init_stream))
         .route("/projects/{id}/tasks", get(list_tasks))
         .route("/projects/{id}/runs", get(list_runs).post(run_task))
         .route(
@@ -275,7 +277,20 @@ async fn delete_project(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn list_tasks(
+async fn repo_status(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    if st.db.get_project(&id).ok().flatten().is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let dest = repo_dir(&st.data_root, &id);
+    let ready = dest.join(".git").exists();
+    Json(json!({ "ready": ready })).into_response()
+}
+
+/// First-time clone / fetch logs for the main UI (tasks poll uses [`list_tasks`] after clone).
+async fn repo_init_stream(
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
@@ -291,14 +306,52 @@ async fn list_tasks(
         }
     };
     let dest = repo_dir(&st.data_root, &id);
-    if !dest.join(".git").exists() {
-        if let Err(e) = git_ops::ensure_repo_latest(&p.repo_url, &dest, &p.build_branch, None).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("prepare repo: {e:#}"),
-            )
-                .into_response();
+
+    let stream = stream! {
+        if dest.join(".git").exists() {
+            yield Ok::<Event, Infallible>(Event::default().data(
+                "=== repository already present ===\n",
+            ));
+            yield Ok::<Event, Infallible>(Event::default().event("end").data(""));
+            return;
         }
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let repo_url = p.repo_url.clone();
+        let branch = p.build_branch.clone();
+        let dest_clone = dest.clone();
+        let task = tokio::spawn(async move {
+            match git_ops::ensure_repo_latest(&repo_url, &dest_clone, &branch, Some(&tx)).await {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = tx.send(format!("ERROR: {e:#}\n"));
+                }
+            }
+            drop(tx);
+        });
+
+        while let Some(chunk) = rx.recv().await {
+            yield Ok::<Event, Infallible>(Event::default().data(chunk));
+        }
+        let _ = task.await;
+        yield Ok::<Event, Infallible>(Event::default().event("end").data(""));
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+        .into_response()
+}
+
+async fn list_tasks(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    if st.db.get_project(&id).ok().flatten().is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let dest = repo_dir(&st.data_root, &id);
+    if !dest.join(".git").exists() {
+        return Json(Vec::<TaskInfo>::new()).into_response();
     }
     match git_ops::microci_scripts(&dest) {
         Ok(paths) => {

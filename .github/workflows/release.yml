@@ -1,0 +1,161 @@
+# Publish cross-platform binaries to GitHub Releases.
+#
+# How to release:
+#   1. Bump version in Cargo.toml (and commit).
+#   2. git tag v0.2.0 && git push origin v0.2.0
+# The tag must match Cargo.toml [package].version (e.g. v0.2.0 ↔ 0.2.0).
+#
+# Requires: repo Settings → Actions → General → Workflow permissions: Read and write.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+            zig: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            name: linux-aarch64
+            zig: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+            zig: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-aarch64
+            zig: false
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+            zig: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig (Linux AArch64 cross)
+        if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        run: cargo install cargo-zigbuild --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Versions
+        run: |
+          rustc -vV
+          cargo -vV
+          node -v
+
+      - name: Cargo build
+        shell: bash
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Strip (Unix)
+        if: runner.os != 'Windows'
+        run: strip "target/${{ matrix.target }}/release/mini-ci" 2>/dev/null || true
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        env:
+          VERSION: ${{ github.ref_name }}
+          NAME: ${{ matrix.name }}
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          chmod +x mini-ci
+          tar czvf "$RUNNER_TEMP/mini-ci-${VERSION}-${NAME}.tar.gz" mini-ci
+          shasum -a 256 "$RUNNER_TEMP/mini-ci-${VERSION}-${NAME}.tar.gz" | tee "$RUNNER_TEMP/mini-ci-${VERSION}-${NAME}.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        env:
+          VERSION: ${{ github.ref_name }}
+          NAME: ${{ matrix.name }}
+        shell: pwsh
+        run: |
+          $dir = "target/${{ matrix.target }}/release"
+          $zip = Join-Path $env:RUNNER_TEMP "mini-ci-$($env:VERSION)-$($env:NAME).zip"
+          Compress-Archive -Path (Join-Path $dir "mini-ci.exe") -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $zip -Leaf)" | Out-File "$zip.sha256" -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/mini-ci-${{ github.ref_name }}-${{ matrix.name }}.*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          crate_ver=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          tag_ver="${TAG#v}"
+          if [ "$crate_ver" != "$tag_ver" ]; then
+            echo "::error::Git tag '$TAG' does not match Cargo.toml version '$crate_ver'. Bump Cargo.toml or retag."
+            exit 1
+          fi
+          echo "Version OK: $crate_ver"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List packages
+        run: find artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

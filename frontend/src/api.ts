@@ -30,6 +30,8 @@ export type Artifact = {
 
 export type TaskInfo = { name: string };
 
+export type RepoStatus = { ready: boolean };
+
 const base = "/api";
 
 async function jsonFetch<T>(
@@ -81,10 +83,21 @@ export async function deleteProject(id: string): Promise<void> {
   }
 }
 
+export function getRepoStatus(id: string) {
+  return jsonFetch<RepoStatus>(
+    `/projects/${encodeURIComponent(id)}/repo/status`,
+  );
+}
+
 export function listTasks(id: string) {
   return jsonFetch<TaskInfo[]>(
     `/projects/${encodeURIComponent(id)}/tasks`,
   );
+}
+
+/** SSE — git clone/fetch log until `.git` exists (first open). */
+export function repoInitStreamUrl(projectId: string) {
+  return `${base}/projects/${encodeURIComponent(projectId)}/repo/init/stream`;
 }
 
 export function listRuns(id: string) {

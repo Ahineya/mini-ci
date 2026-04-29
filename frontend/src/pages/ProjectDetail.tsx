@@ -7,10 +7,12 @@ import {
   deleteProject,
   deleteRun,
   getProject,
+  getRepoStatus,
   getRun,
   listArtifacts,
   listRuns,
   listTasks,
+  repoInitStreamUrl,
   runLogStreamUrl,
   runTask,
   type Artifact,
@@ -52,6 +54,9 @@ export function ProjectDetail() {
   const [pollRunId, setPollRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("runs");
+  /** null = initial; true = need clone UX; false = repo ready */
+  const [needsRepoClone, setNeedsRepoClone] = useState<boolean | null>(null);
+  const [repoSetupActive, setRepoSetupActive] = useState(false);
 
   const logOffsetRef = useRef<number>(0);
   const logStore = useMemo(() => new LogStore(), []);
@@ -60,7 +65,13 @@ export function ProjectDetail() {
   const load = useCallback(async () => {
     if (!id) return;
     setError(null);
-    const [p, r, a] = await Promise.all([getProject(id), listRuns(id), listArtifacts(id)]);
+    const [rs, p, r, a] = await Promise.all([
+      getRepoStatus(id),
+      getProject(id),
+      listRuns(id),
+      listArtifacts(id),
+    ]);
+    setNeedsRepoClone(!rs.ready);
     setProject(p);
     setRuns(r);
     setArtifacts(a);
@@ -74,6 +85,30 @@ export function ProjectDetail() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /* ---- first clone: stream git output into the main log ---- */
+  useEffect(() => {
+    if (!id || needsRepoClone !== true) return;
+    logStore.clear();
+    setRepoSetupActive(true);
+    const es = new EventSource(repoInitStreamUrl(id));
+
+    es.onmessage = (ev: MessageEvent) => {
+      logStore.append(ev.data as string);
+    };
+
+    es.addEventListener("end", () => {
+      es.close();
+      setRepoSetupActive(false);
+      setNeedsRepoClone(false);
+      void load();
+    });
+
+    return () => {
+      es.close();
+      setRepoSetupActive(false);
+    };
+  }, [id, needsRepoClone, logStore, load]);
 
   /* ---- live log: SSE (server wakes on each append; no 400ms polling) ---- */
   useEffect(() => {
@@ -406,6 +441,8 @@ export function ProjectDetail() {
                   {activeRun.status}
                 </span>
               </>
+            ) : repoSetupActive ? (
+              <span className="text-sm text-warning">Setting up repository (git clone)…</span>
             ) : (
               <span className="text-sm text-text-tertiary">Select a run or start a task to view logs</span>
             )}
