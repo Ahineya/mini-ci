@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::models::{ArtifactRow, Project, RunMeta, RunRow};
+use crate::models::{ArtifactRow, PatchProject, Project, RunMeta, RunRow};
 
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -50,21 +51,44 @@ impl Db {
             ",
         )
         .context("migrate")?;
+        Self::migrate_projects_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
+    fn migrate_projects_schema(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('projects')")?;
+        let cols: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        if !cols.contains("auto_run_on_change") {
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN auto_run_on_change INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !cols.contains("auto_run_task") {
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN auto_run_task TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "INSERT INTO projects (id, name, repo_url, dist_path, build_branch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO projects (id, name, repo_url, dist_path, build_branch, auto_run_on_change, auto_run_task, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 p.id,
                 p.name,
                 p.repo_url,
                 p.dist_path,
                 p.build_branch,
+                p.auto_run_on_change as i64,
+                p.auto_run_task,
                 p.created_at.timestamp(),
             ],
         )?;
@@ -74,7 +98,7 @@ impl Db {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT id, name, repo_url, dist_path, build_branch, created_at FROM projects ORDER BY created_at DESC",
+            "SELECT id, name, repo_url, dist_path, build_branch, auto_run_on_change, auto_run_task, created_at FROM projects ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
@@ -83,7 +107,9 @@ impl Db {
                 repo_url: row.get(2)?,
                 dist_path: row.get(3)?,
                 build_branch: row.get(4)?,
-                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(5)?, 0)
+                auto_run_on_change: row.get::<_, i64>(5)? != 0,
+                auto_run_task: row.get(6)?,
+                created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(7)?, 0)
                     .unwrap_or_else(chrono::Utc::now),
             })
         })?;
@@ -103,7 +129,7 @@ impl Db {
     pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT id, name, repo_url, dist_path, build_branch, created_at FROM projects WHERE id = ?1",
+            "SELECT id, name, repo_url, dist_path, build_branch, auto_run_on_change, auto_run_task, created_at FROM projects WHERE id = ?1",
         )?;
         stmt
             .query_row(params![id], |row| {
@@ -113,12 +139,37 @@ impl Db {
                     repo_url: row.get(2)?,
                     dist_path: row.get(3)?,
                     build_branch: row.get(4)?,
-                    created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(5)?, 0)
+                    auto_run_on_change: row.get::<_, i64>(5)? != 0,
+                    auto_run_task: row.get(6)?,
+                    created_at: chrono::DateTime::from_timestamp(row.get::<_, i64>(7)?, 0)
                         .unwrap_or_else(chrono::Utc::now),
                 })
             })
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn patch_project(&self, id: &str, patch: &PatchProject) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE projects SET auto_run_on_change = ?2, auto_run_task = ?3 WHERE id = ?1",
+            params![
+                id,
+                patch.auto_run_on_change as i64,
+                patch.auto_run_task.trim(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn project_has_running_run(&self, project_id: &str) -> Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM runs WHERE project_id = ?1 AND status = 'running'",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     pub fn insert_run(&self, r: &RunRow) -> Result<()> {

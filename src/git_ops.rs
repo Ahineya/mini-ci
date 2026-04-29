@@ -179,6 +179,61 @@ fn maybe_create_parent(dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Compare local `HEAD` to the remote branch tip via `git ls-remote` (does not fetch — avoids
+/// leaving FETCH_HEAD ahead of HEAD between polls and triggering duplicate auto-runs).
+pub async fn remote_has_new_commits(repo_url: &str, dest: &Path, branch: &str) -> Result<bool> {
+    if !dest.join(".git").exists() {
+        return Ok(false);
+    }
+
+    let local = git_rev_parse(dest, "HEAD").await?;
+
+    let spec = format!("refs/heads/{branch}");
+    let out = Command::new("git")
+        .args(["ls-remote", repo_url, &spec])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("git ls-remote")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let remote_sha = stdout
+        .lines()
+        .find(|l| !l.is_empty())
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_string);
+
+    let Some(remote_sha) = remote_sha else {
+        return Ok(false);
+    };
+
+    Ok(remote_sha != local)
+}
+
+async fn git_rev_parse(dest: &Path, rev: &str) -> Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(dest)
+        .output()
+        .await
+        .with_context(|| format!("git rev-parse {rev}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-parse {} failed: {}",
+            rev,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn microci_scripts(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let dir = repo_root.join(".mini-ci");
     if !dir.is_dir() {

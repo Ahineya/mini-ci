@@ -26,6 +26,14 @@ fn main() {
         return;
     }
 
+    let node_modules = frontend.join("node_modules");
+    let vite_pkg = node_modules.join("vite/package.json");
+    let vite_bin = node_modules.join(".bin/vite");
+    if vite_bin.exists() && !vite_pkg.exists() {
+        eprintln!("mini-ci: removing incomplete node_modules (vite stub without package)");
+        let _ = std::fs::remove_dir_all(&node_modules);
+    }
+
     let status = Command::new("npm")
         .current_dir(&frontend)
         .args(["ci"])

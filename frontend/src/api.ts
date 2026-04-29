@@ -4,6 +4,10 @@ export type Project = {
   repo_url: string;
   dist_path: string;
   build_branch: string;
+  /** Poll remote ~every 15s and run `auto_run_task` when new commits appear. */
+  auto_run_on_change: boolean;
+  /** Basename of a `.mini-ci/*.sh` script (e.g. `build.sh`). */
+  auto_run_task: string;
   created_at: string;
 };
 
@@ -71,6 +75,16 @@ export function createProject(body: {
 
 export function getProject(id: string) {
   return jsonFetch<Project>(`/projects/${encodeURIComponent(id)}`);
+}
+
+export function patchProject(
+  id: string,
+  body: { auto_run_on_change: boolean; auto_run_task: string },
+) {
+  return jsonFetch<Project>(`/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
 }
 
 export async function deleteProject(id: string): Promise<void> {

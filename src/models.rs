@@ -7,6 +7,10 @@ pub struct Project {
     pub repo_url: String,
     pub dist_path: String,
     pub build_branch: String,
+    /// When true, periodically fetch the remote and run `auto_run_task` when new commits appear.
+    pub auto_run_on_change: bool,
+    /// Basename of a `.mini-ci/*.sh` script (e.g. `build.sh`).
+    pub auto_run_task: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -16,6 +20,16 @@ pub struct CreateProject {
     pub repo_url: String,
     pub dist_path: String,
     pub build_branch: String,
+    #[serde(default)]
+    pub auto_run_on_change: bool,
+    #[serde(default)]
+    pub auto_run_task: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchProject {
+    pub auto_run_on_change: bool,
+    pub auto_run_task: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

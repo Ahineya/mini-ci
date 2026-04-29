@@ -25,15 +25,19 @@ use axum::Json;
 use axum::Router;
 use embed::Assets;
 use models::{
-    ArtifactRow, CreateProject, Project, RunRow, RunTaskBody, TaskInfo,
+    ArtifactRow, CreateProject, PatchProject, Project, RunRow, RunTaskBody, TaskInfo,
 };
 use serde_json::json;
 use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(name = "mini-ci")]
-#[command(about = "Single-binary mini CI server with web UI")]
+#[command(
+    name = "mini-ci",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Single-binary mini CI server with web UI"
+)]
 struct Cli {
     /// Listen address (localhost only by default; use 0.0.0.0 for all interfaces / LAN access)
     #[arg(long, default_value = "127.0.0.1")]
@@ -55,8 +59,25 @@ struct AppState {
     run_notifies: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
 }
 
+fn version_only_invocation() -> bool {
+    let mut args = std::env::args_os();
+    args.next(); // argv[0]
+    match (args.next(), args.next()) {
+        (Some(a), None) => {
+            let s = a.to_string_lossy();
+            s == "--version" || s == "-V"
+        }
+        _ => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if version_only_invocation() {
+        println!("mini-ci {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -82,9 +103,16 @@ async fn main() -> anyhow::Result<()> {
         run_notifies: Arc::new(RwLock::new(HashMap::new())),
     };
 
+    tokio::spawn(repo_poll_loop(state.clone()));
+
     let api = Router::new()
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/{id}", get(get_project).delete(delete_project))
+        .route(
+            "/projects/{id}",
+            get(get_project)
+                .delete(delete_project)
+                .patch(patch_project),
+        )
         .route("/projects/{id}/repo/status", get(repo_status))
         .route("/projects/{id}/repo/init/stream", get(repo_init_stream))
         .route("/projects/{id}/tasks", get(list_tasks))
@@ -236,10 +264,50 @@ async fn get_project(
     }
 }
 
+async fn patch_project(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    axum::Json(body): axum::Json<PatchProject>,
+) -> impl IntoResponse {
+    if st.db.get_project(&id).ok().flatten().is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if body.auto_run_on_change && body.auto_run_task.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "auto_run_task is required when auto_run_on_change is enabled",
+        )
+            .into_response();
+    }
+    if let Err(e) = st.db.patch_project(&id, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
+        )
+            .into_response();
+    }
+    match st.db.get_project(&id) {
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn create_project(
     State(st): State<AppState>,
     axum::Json(body): axum::Json<CreateProject>,
 ) -> impl IntoResponse {
+    if body.auto_run_on_change && body.auto_run_task.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "auto_run_task is required when auto_run_on_change is enabled",
+        )
+            .into_response();
+    }
     let id = Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now();
     let p = Project {
@@ -248,6 +316,8 @@ async fn create_project(
         repo_url: body.repo_url,
         dist_path: body.dist_path,
         build_branch: body.build_branch,
+        auto_run_on_change: body.auto_run_on_change,
+        auto_run_task: body.auto_run_task.trim().to_string(),
         created_at,
     };
     if let Err(e) = st.db.insert_project(&p) {
@@ -571,6 +641,229 @@ async fn run_log_sse(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 
+async fn repo_poll_loop(st: AppState) {
+    let mut ticker = interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(e) = repo_poll_once(&st).await {
+            tracing::warn!(error = %e, "repo poll tick");
+        }
+    }
+}
+
+async fn repo_poll_once(st: &AppState) -> anyhow::Result<()> {
+    let projects = st.db.list_projects()?;
+    for p in projects {
+        if !p.auto_run_on_change || p.auto_run_task.trim().is_empty() {
+            continue;
+        }
+        let repo = repo_dir(&st.data_root, &p.id);
+        if !repo.join(".git").is_dir() {
+            continue;
+        }
+        if st.db.project_has_running_run(&p.id)? {
+            continue;
+        }
+        let task = p.auto_run_task.trim().to_string();
+        match git_ops::remote_has_new_commits(&p.repo_url, &repo, &p.build_branch).await {
+            Ok(true) => {
+                tracing::info!(
+                    project_id = %p.id,
+                    task = %task,
+                    "poll: new commits on remote, starting auto-run"
+                );
+                match spawn_project_run(
+                    st,
+                    p.clone(),
+                    task,
+                    Some("=== Auto-run: new commits on remote ===\n".to_string()),
+                )
+                .await
+                {
+                    Ok(run_id) => {
+                        tracing::debug!(run_id = %run_id, "auto-run started");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "auto-run failed to start"),
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(project_id = %p.id, error = %e, "poll: git check failed"),
+        }
+    }
+    Ok(())
+}
+
+async fn spawn_project_run(
+    st: &AppState,
+    project: Project,
+    script_name: String,
+    preamble: Option<String>,
+) -> Result<String, String> {
+    let script_name = script_name.trim().to_string();
+    if script_name.contains('/') || script_name.contains('\\') || script_name.is_empty() {
+        return Err("task_name must be a bare filename like build.sh".into());
+    }
+    let project_id = project.id.clone();
+    let run_id = Uuid::new_v4().to_string();
+    let run_id_response = run_id.clone();
+    let started = chrono::Utc::now();
+    let row = RunRow {
+        id: run_id.clone(),
+        project_id: project_id.clone(),
+        task_name: script_name.clone(),
+        status: "running".to_string(),
+        log: String::new(),
+        started_at: Some(started),
+        finished_at: None,
+    };
+    if let Err(e) = st.db.insert_run(&row) {
+        return Err(format!("{e:#}"));
+    }
+
+    let notify = Arc::new(Notify::new());
+    {
+        let mut map = st.run_notifies.write().await;
+        map.insert(run_id.clone(), notify.clone());
+    }
+
+    let db = st.db.clone();
+    let data_root = st.data_root.clone();
+    let repo = repo_dir(&st.data_root, &project_id);
+    let run_notifies = st.run_notifies.clone();
+    let notify_bg = notify.clone();
+
+    tokio::spawn(async move {
+        run_task_background(
+            db,
+            data_root,
+            run_notifies,
+            project,
+            project_id,
+            run_id,
+            script_name,
+            notify_bg,
+            preamble,
+            repo,
+        )
+        .await;
+    });
+
+    Ok(run_id_response)
+}
+
+async fn run_task_background(
+    db: Arc<db::Db>,
+    data_root: PathBuf,
+    run_notifies: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
+    project: Project,
+    project_id: String,
+    run_id: String,
+    script_name: String,
+    notify: Arc<Notify>,
+    preamble: Option<String>,
+    repo: PathBuf,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    if let Some(pre) = preamble {
+        let _ = tx.send(pre);
+    }
+    let db_log = db.clone();
+    let rid = run_id.clone();
+    let n = notify.clone();
+    let log_writer = tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            let _ = db_log.append_run_log(&rid, &chunk);
+            n.notify_waiters();
+        }
+    });
+
+    // 1) Clone or pull — git output goes into the run log
+    if let Err(e) = git_ops::ensure_repo_latest(
+        &project.repo_url,
+        &repo,
+        &project.build_branch,
+        Some(&tx),
+    )
+    .await
+    {
+        let _ = tx.send(format!("ERROR: repository update failed: {e:#}\n"));
+        drop(tx);
+        let _ = log_writer.await;
+        let fin = chrono::Utc::now();
+        let _ = db.set_run_status(&run_id, "failed", Some(fin));
+        finalize_run_notifier(&notify, &run_notifies, &run_id).await;
+        return;
+    }
+
+    // 2) Verify script exists after clone
+    let script_path = repo.join(".mini-ci").join(&script_name);
+    if !script_path.is_file() {
+        let _ = tx.send(format!("ERROR: script not found: .mini-ci/{script_name}\n"));
+        drop(tx);
+        let _ = log_writer.await;
+        let fin = chrono::Utc::now();
+        let _ = db.set_run_status(&run_id, "failed", Some(fin));
+        finalize_run_notifier(&notify, &run_notifies, &run_id).await;
+        return;
+    }
+
+    // 3) Run the build script
+    let run_result = runner::run_shell_script(&script_path, &repo, tx).await;
+    let _ = log_writer.await;
+
+    let exit_msg = match &run_result {
+        Ok(code) => format!("\n--- exit code: {code} ---\n"),
+        Err(e) => format!("\n--- runner error: {e:#} ---\n"),
+    };
+    let _ = db.append_run_log(&run_id, &exit_msg);
+    notify.notify_waiters();
+
+    // Terminal status as soon as the .sh exits — NOT after packaging. SSE `done` keys off this row.
+    let status = match &run_result {
+        Ok(0) => "success",
+        Ok(_) => "failed",
+        Err(_) => "failed",
+    };
+    let finished = chrono::Utc::now();
+    let _ = db.set_run_status(&run_id, status, Some(finished));
+    notify.notify_waiters();
+
+    if matches!(&run_result, Ok(0)) {
+        let _ = db.append_run_log(&run_id, "\n=== packaging dist… ===\n");
+        notify.notify_waiters();
+
+        match try_package_dist(&db, &data_root, &project, &project_id).await {
+            Ok(Some((name, bytes, _))) => {
+                let _ = db.append_run_log(
+                    &run_id,
+                    &format!("\n=== artifact: {name} ({bytes} bytes) ===\n"),
+                );
+                notify.notify_waiters();
+            }
+            Ok(None) => {
+                let _ = db.append_run_log(
+                    &run_id,
+                    &format!(
+                        "\n=== artifact skipped: `{}` is not a directory (build must create it under the project dist path) ===\n",
+                        project.dist_path
+                    ),
+                );
+                notify.notify_waiters();
+            }
+            Err(e) => {
+                let _ = db.append_run_log(
+                    &run_id,
+                    &format!("\n=== artifact zip failed: {e:#} ===\n"),
+                );
+                notify.notify_waiters();
+            }
+        }
+    }
+
+    finalize_run_notifier(&notify, &run_notifies, &run_id).await;
+}
+
 async fn run_task(
     State(st): State<AppState>,
     AxPath(project_id): AxPath<String>,
@@ -588,148 +881,16 @@ async fn run_task(
         }
     };
 
-    let script_name = body.task_name.trim().to_string();
-    if script_name.contains('/') || script_name.contains('\\') || script_name.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "task_name must be a bare filename like build.sh",
-        )
-            .into_response();
-    }
-
-    let run_id = Uuid::new_v4().to_string();
-    let run_id_response = run_id.clone();
-    let started = chrono::Utc::now();
-    let row = RunRow {
-        id: run_id.clone(),
-        project_id: project_id.clone(),
-        task_name: script_name.clone(),
-        status: "running".to_string(),
-        log: String::new(),
-        started_at: Some(started),
-        finished_at: None,
-    };
-    if let Err(e) = st.db.insert_run(&row) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{e:#}"),
-        )
-            .into_response();
-    }
-
-    let notify = Arc::new(Notify::new());
-    {
-        let mut map = st.run_notifies.write().await;
-        map.insert(run_id.clone(), notify.clone());
-    }
-
-    let db = st.db.clone();
-    let data_root = st.data_root.clone();
-    let repo = repo_dir(&st.data_root, &project_id);
-    let run_notifies = st.run_notifies.clone();
-    let notify_bg = notify.clone();
-
-    tokio::spawn(async move {
-        let notify = notify_bg;
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        let db_log = db.clone();
-        let rid = run_id.clone();
-        let n = notify.clone();
-        let log_writer = tokio::spawn(async move {
-            while let Some(chunk) = rx.recv().await {
-                let _ = db_log.append_run_log(&rid, &chunk);
-                n.notify_waiters();
-            }
-        });
-
-        // 1) Clone or pull — git output goes into the run log
-        if let Err(e) = git_ops::ensure_repo_latest(
-            &project.repo_url,
-            &repo,
-            &project.build_branch,
-            Some(&tx),
-        )
-        .await
-        {
-            let _ = tx.send(format!("ERROR: repository update failed: {e:#}\n"));
-            drop(tx);
-            let _ = log_writer.await;
-            let fin = chrono::Utc::now();
-            let _ = db.set_run_status(&run_id, "failed", Some(fin));
-            finalize_run_notifier(&notify, &run_notifies, &run_id).await;
-            return;
-        }
-
-        // 2) Verify script exists after clone
-        let script_path = repo.join(".mini-ci").join(&script_name);
-        if !script_path.is_file() {
-            let _ = tx.send(format!("ERROR: script not found: .mini-ci/{script_name}\n"));
-            drop(tx);
-            let _ = log_writer.await;
-            let fin = chrono::Utc::now();
-            let _ = db.set_run_status(&run_id, "failed", Some(fin));
-            finalize_run_notifier(&notify, &run_notifies, &run_id).await;
-            return;
-        }
-
-        // 3) Run the build script
-        let run_result =
-            runner::run_shell_script(&script_path, &repo, tx).await;
-        let _ = log_writer.await;
-
-        let exit_msg = match &run_result {
-            Ok(code) => format!("\n--- exit code: {code} ---\n"),
-            Err(e) => format!("\n--- runner error: {e:#} ---\n"),
-        };
-        let _ = db.append_run_log(&run_id, &exit_msg);
-        notify.notify_waiters();
-
-        // Terminal status as soon as the .sh exits — NOT after packaging. SSE `done` keys off this row.
-        let status = match &run_result {
-            Ok(0) => "success",
-            Ok(_) => "failed",
-            Err(_) => "failed",
-        };
-        let finished = chrono::Utc::now();
-        let _ = db.set_run_status(&run_id, status, Some(finished));
-        notify.notify_waiters();
-
-        if matches!(&run_result, Ok(0)) {
-            let _ = db.append_run_log(&run_id, "\n=== packaging dist… ===\n");
-            notify.notify_waiters();
-
-            match try_package_dist(&db, &data_root, &project, &project_id).await {
-                Ok(Some((name, bytes, _))) => {
-                    let _ = db.append_run_log(
-                        &run_id,
-                        &format!("\n=== artifact: {name} ({bytes} bytes) ===\n"),
-                    );
-                    notify.notify_waiters();
-                }
-                Ok(None) => {
-                    let _ = db.append_run_log(
-                        &run_id,
-                        &format!(
-                            "\n=== artifact skipped: `{}` is not a directory (build must create it under the project dist path) ===\n",
-                            project.dist_path
-                        ),
-                    );
-                    notify.notify_waiters();
-                }
-                Err(e) => {
-                    let _ = db.append_run_log(
-                        &run_id,
-                        &format!("\n=== artifact zip failed: {e:#} ===\n"),
-                    );
-                    notify.notify_waiters();
-                }
+    match spawn_project_run(&st, project, body.task_name, None).await {
+        Ok(run_id) => Json(json!({ "run_id": run_id })).into_response(),
+        Err(msg) => {
+            if msg.contains("task_name must be") {
+                (StatusCode::BAD_REQUEST, msg).into_response()
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
         }
-
-        finalize_run_notifier(&notify, &run_notifies, &run_id).await;
-    });
-
-    Json(json!({ "run_id": run_id_response })).into_response()
+    }
 }
 
 async fn list_artifacts(

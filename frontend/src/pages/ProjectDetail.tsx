@@ -9,6 +9,7 @@ import {
   deleteRun,
   getProject,
   getRepoStatus,
+  patchProject,
   getRun,
   listArtifacts,
   listRuns,
@@ -58,8 +59,13 @@ export function ProjectDetail() {
   /** null = initial; true = need clone UX; false = repo ready */
   const [needsRepoClone, setNeedsRepoClone] = useState<boolean | null>(null);
   const [repoSetupActive, setRepoSetupActive] = useState(false);
+  const [draftAutoRun, setDraftAutoRun] = useState(false);
+  const [draftAutoTask, setDraftAutoTask] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
 
   const logOffsetRef = useRef<number>(0);
+  /** Prevents duplicate SSE `done` events from forcing Artifacts tab again after user switches back to Runs. */
+  const artifactTabHandledForRunId = useRef<string | null>(null);
   const logStore = useMemo(() => new LogStore(), []);
 
   /** Newest first (matches API); tie-break for stable order. */
@@ -96,6 +102,38 @@ export function ProjectDetail() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!project) return;
+    setDraftAutoRun(project.auto_run_on_change ?? false);
+    setDraftAutoTask(project.auto_run_task ?? "");
+  }, [project]);
+
+  /** Reset artifact-tab guard when a new live log session starts (manual or auto-run). */
+  useEffect(() => {
+    if (pollRunId) {
+      artifactTabHandledForRunId.current = null;
+    }
+  }, [pollRunId]);
+
+  /** Poll runs/artifacts so server-started jobs (e.g. auto-run) show up without reload. */
+  useEffect(() => {
+    if (!id) return;
+    const tick = async () => {
+      try {
+        const [r, a] = await Promise.all([listRuns(id), listArtifacts(id)]);
+        setRuns(r);
+        setArtifacts(a);
+      } catch {
+        /* ignore */
+      }
+    };
+    const iv = setInterval(() => {
+      void tick();
+    }, 4000);
+    void tick();
+    return () => clearInterval(iv);
+  }, [id]);
 
   /* ---- first clone: stream git output into the main log ---- */
   useEffect(() => {
@@ -160,7 +198,10 @@ export function ProjectDetail() {
           finished_at: d.finished_at,
         });
         if (d.status === "success") {
-          setTab("artifacts");
+          if (artifactTabHandledForRunId.current !== d.id) {
+            artifactTabHandledForRunId.current = d.id;
+            setTab("artifacts");
+          }
         }
         void load();
       } catch {
@@ -253,6 +294,27 @@ export function ProjectDetail() {
     }
   }
 
+  async function saveAutoRunSettings() {
+    if (!project || !id) return;
+    if (draftAutoRun && !draftAutoTask.trim()) {
+      setError("Select a task script when auto-run is enabled.");
+      return;
+    }
+    setError(null);
+    setSettingsSaving(true);
+    try {
+      const updated = await patchProject(project.id, {
+        auto_run_on_change: draftAutoRun,
+        auto_run_task: draftAutoTask.trim(),
+      });
+      setProject(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
   async function onDeleteArtifact(e: React.MouseEvent, artifactId: string) {
     e.preventDefault();
     e.stopPropagation();
@@ -316,6 +378,78 @@ export function ProjectDetail() {
           <p className="mt-3 rounded-lg border border-danger/20 bg-danger-muted px-3 py-2 text-sm text-danger">
             {error}
           </p>
+        )}
+
+        {project && (
+          <details className="group mt-3 rounded-md border border-border bg-surface-1/60">
+            <summary className="cursor-pointer list-none px-3 py-2 text-xs text-text-secondary transition hover:bg-surface-2/80 [&::-webkit-details-marker]:hidden">
+              <span className="flex items-center justify-between gap-2">
+                <span className="font-medium text-text-tertiary">
+                  Auto-run{" "}
+                  <span className="font-normal text-text-secondary">
+                    {draftAutoRun && draftAutoTask.trim()
+                      ? `· ${draftAutoTask.trim()}`
+                      : draftAutoRun
+                        ? "· (pick script)"
+                        : "· off"}
+                  </span>
+                </span>
+                <svg
+                  className="h-4 w-4 shrink-0 text-text-tertiary transition group-open:rotate-180"
+                  viewBox="0 0 14 14"
+                  fill="none"
+                  aria-hidden
+                >
+                  <path d="M3.5 5.25L7 8.75L10.5 5.25" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+            </summary>
+            <div className="space-y-2 border-t border-border px-3 pb-3 pt-2">
+              <p className="text-[11px] leading-snug text-text-tertiary">
+                Polls remote ~15s; on new commits runs the chosen script like a manual build.
+              </p>
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-text-primary">
+                <input
+                  type="checkbox"
+                  checked={draftAutoRun}
+                  onChange={(e) => setDraftAutoRun(e.target.checked)}
+                  className="rounded border-border"
+                />
+                Enable
+              </label>
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="flex min-w-[140px] flex-1 flex-col gap-1 text-[11px] text-text-tertiary">
+                  Task
+                  <select
+                    value={draftAutoTask}
+                    onChange={(e) => setDraftAutoTask(e.target.value)}
+                    disabled={!draftAutoRun}
+                    className="rounded border border-border bg-surface-0 px-2 py-1.5 font-mono text-xs text-text-primary outline-none transition disabled:opacity-50"
+                  >
+                    <option value="">— script —</option>
+                    {tasks.map((t) => (
+                      <option key={t.name} value={t.name}>
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  disabled={
+                    settingsSaving || (draftAutoRun && !draftAutoTask.trim())
+                  }
+                  onClick={() => void saveAutoRunSettings()}
+                  className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-surface-0 transition hover:brightness-110 disabled:opacity-40"
+                >
+                  {settingsSaving ? "…" : "Save"}
+                </button>
+              </div>
+              {tasks.length === 0 && draftAutoRun && (
+                <p className="text-[11px] text-warning">Clone repo first so tasks appear.</p>
+              )}
+            </div>
+          </details>
         )}
       </div>
 
