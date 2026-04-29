@@ -13,7 +13,6 @@ import {
   listTasks,
   packageProject,
   runTask,
-  syncProject,
   type Artifact,
   type Project,
   type Run,
@@ -35,7 +34,7 @@ function StatusDot({ status }: { status: string }) {
 /* ------------------------------------------------------------------ */
 /*  Tabs                                                               */
 /* ------------------------------------------------------------------ */
-type Tab = "runs" | "sync" | "artifacts";
+type Tab = "runs" | "artifacts";
 
 /* ------------------------------------------------------------------ */
 /*  Main component                                                     */
@@ -49,15 +48,11 @@ export function ProjectDetail() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
 
-  const [syncLog, setSyncLog] = useState("");
-  const [syncing, setSyncing] = useState(false);
-
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [pollRunId, setPollRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("runs");
 
-  const syncLogRef = useRef<HTMLPreElement>(null);
   const logOffsetRef = useRef<number>(0);
   const logStore = useMemo(() => new LogStore(), []);
 
@@ -102,30 +97,10 @@ export function ProjectDetail() {
     return () => clearInterval(t);
   }, [pollRunId, id, load, logStore]);
 
-  /* auto-scroll sync log */
-  useEffect(() => {
-    if (syncLogRef.current) syncLogRef.current.scrollTop = syncLogRef.current.scrollHeight;
-  }, [syncLog]);
-
   if (!id) return <p className="p-8 text-text-tertiary">Missing project id.</p>;
   const projectId = id;
 
   /* ---- actions ---- */
-  async function onSync() {
-    setError(null);
-    setSyncLog("");
-    setSyncing(true);
-    setTab("sync");
-    try {
-      await syncProject(projectId, (chunk) => setSyncLog((prev) => prev + chunk));
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSyncing(false);
-    }
-  }
-
   async function onRemoveProject() {
     if (!project) return;
     if (!window.confirm(`Delete "${project.name}"? This cannot be undone.`)) return;
@@ -232,25 +207,6 @@ export function ProjectDetail() {
           <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
-              disabled={syncing}
-              onClick={() => void onSync()}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-1.5 text-sm text-text-primary transition hover:bg-surface-3 disabled:opacity-50"
-            >
-              {syncing ? (
-                <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 16 16" fill="none">
-                  <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" opacity="0.3" />
-                  <path d="M14 8a6 6 0 00-6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                </svg>
-              ) : (
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                  <path d="M1.5 7a5.5 5.5 0 019.37-3.9M12.5 7a5.5 5.5 0 01-9.37 3.9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-                  <path d="M10.5 0.5v3h3M3.5 13.5v-3h-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              )}
-              {syncing ? "Syncing..." : "Sync"}
-            </button>
-            <button
-              type="button"
               onClick={() => void onPackage()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-surface-0 transition hover:brightness-110"
             >
@@ -315,9 +271,6 @@ export function ProjectDetail() {
           <div className="flex gap-1 border-b border-border px-4 py-2">
             <button type="button" onClick={() => setTab("runs")} className={tabClass("runs")}>
               Runs
-            </button>
-            <button type="button" onClick={() => setTab("sync")} className={tabClass("sync")}>
-              Sync
             </button>
             <button type="button" onClick={() => setTab("artifacts")} className={tabClass("artifacts")}>
               Artifacts
@@ -391,15 +344,6 @@ export function ProjectDetail() {
                   </div>
                 )}
               </div>
-            )}
-
-            {tab === "sync" && (
-              <pre
-                ref={syncLogRef}
-                className="log-container h-full overflow-auto p-4 font-mono text-xs leading-relaxed text-text-secondary"
-              >
-                {syncLog || (syncing ? "Starting sync..." : "Click Sync to fetch git output.")}
-              </pre>
             )}
 
             {tab === "artifacts" && (

@@ -55,7 +55,6 @@ async fn main() -> anyhow::Result<()> {
     let api = Router::new()
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).delete(delete_project))
-        .route("/projects/{id}/sync", post(sync_project))
         .route("/projects/{id}/tasks", get(list_tasks))
         .route("/projects/{id}/runs", get(list_runs).post(run_task))
         .route("/projects/{id}/runs/{run_id}", get(get_run).delete(delete_run))
@@ -171,35 +170,6 @@ async fn create_project(
     Json(p).into_response()
 }
 
-async fn sync_project(
-    State(st): State<AppState>,
-    AxPath(id): AxPath<String>,
-) -> impl IntoResponse {
-    let p = match st.db.get_project(&id) {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{e:#}"),
-            )
-                .into_response()
-        }
-    };
-
-    let dest = repo_dir(&st.data_root, &id);
-    let stream = git_ops::sync_repository_stream(p.repo_url, dest, p.build_branch);
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; charset=utf-8",
-        )],
-        Body::from_stream(stream),
-    )
-        .into_response()
-}
-
 async fn delete_project(
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
@@ -225,16 +195,26 @@ async fn list_tasks(
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> impl IntoResponse {
-    if st.db.get_project(&id).ok().flatten().is_none() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
+    let p = match st.db.get_project(&id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}"),
+            )
+                .into_response()
+        }
+    };
     let dest = repo_dir(&st.data_root, &id);
     if !dest.join(".git").exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Repository not cloned yet. Sync first.",
-        )
-            .into_response();
+        if let Err(e) = git_ops::ensure_repo_latest(&p.repo_url, &dest, &p.build_branch, None).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("prepare repo: {e:#}"),
+            )
+                .into_response();
+        }
     }
     match git_ops::microci_scripts(&dest) {
         Ok(paths) => {
@@ -330,8 +310,8 @@ async fn run_task(
     AxPath(project_id): AxPath<String>,
     axum::Json(body): axum::Json<RunTaskBody>,
 ) -> impl IntoResponse {
-    match st.db.get_project(&project_id) {
-        Ok(Some(_)) => {}
+    let project = match st.db.get_project(&project_id) {
+        Ok(Some(p)) => p,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             return (
@@ -340,31 +320,13 @@ async fn run_task(
             )
                 .into_response()
         }
-    }
+    };
 
-    let repo = repo_dir(&st.data_root, &project_id);
-    if !repo.join(".git").exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Clone and sync the repository before running tasks.",
-        )
-            .into_response();
-    }
-
-    let script_name = body.task_name.trim();
+    let script_name = body.task_name.trim().to_string();
     if script_name.contains('/') || script_name.contains('\\') || script_name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             "task_name must be a bare filename like build.sh",
-        )
-            .into_response();
-    }
-
-    let script_path = repo.join(".mini-ci").join(script_name);
-    if !script_path.is_file() {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("Script not found: .mini-ci/{script_name}"),
         )
             .into_response();
     }
@@ -375,7 +337,7 @@ async fn run_task(
     let row = RunRow {
         id: run_id.clone(),
         project_id: project_id.clone(),
-        task_name: script_name.to_string(),
+        task_name: script_name.clone(),
         status: "running".to_string(),
         log: String::new(),
         started_at: Some(started),
@@ -390,8 +352,7 @@ async fn run_task(
     }
 
     let db = st.db.clone();
-    let repo_clone = repo.clone();
-    let script_path_clone = script_path.clone();
+    let repo = repo_dir(&st.data_root, &project_id);
 
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -403,8 +364,35 @@ async fn run_task(
             }
         });
 
+        // 1) Clone or pull — git output goes into the run log
+        if let Err(e) = git_ops::ensure_repo_latest(
+            &project.repo_url,
+            &repo,
+            &project.build_branch,
+            Some(&tx),
+        )
+        .await
+        {
+            let _ = tx.send(format!("ERROR: repository update failed: {e:#}\n"));
+            drop(tx);
+            let _ = log_writer.await;
+            let _ = db.set_run_status(&run_id, "failed", Some(chrono::Utc::now()));
+            return;
+        }
+
+        // 2) Verify script exists after clone
+        let script_path = repo.join(".mini-ci").join(&script_name);
+        if !script_path.is_file() {
+            let _ = tx.send(format!("ERROR: script not found: .mini-ci/{script_name}\n"));
+            drop(tx);
+            let _ = log_writer.await;
+            let _ = db.set_run_status(&run_id, "failed", Some(chrono::Utc::now()));
+            return;
+        }
+
+        // 3) Run the build script
         let run_result =
-            runner::run_shell_script(&script_path_clone, &repo_clone, tx).await;
+            runner::run_shell_script(&script_path, &repo, tx).await;
         let _ = log_writer.await;
 
         let exit_msg = match &run_result {
