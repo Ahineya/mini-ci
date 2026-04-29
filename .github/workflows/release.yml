@@ -36,17 +36,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             name: linux-aarch64
             zig: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: windows-x86_64
-            zig: false
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macos-aarch64
-            zig: false
-          - os: macos-13
-            target: x86_64-apple-darwin
-            name: macos-x86_64
             zig: false
 
     steps:
@@ -87,12 +79,10 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      - name: Strip (Unix)
-        if: runner.os != 'Windows'
+      - name: Strip
         run: strip "target/${{ matrix.target }}/release/mini-ci" 2>/dev/null || true
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         env:
           VERSION: ${{ github.ref_name }}
           NAME: ${{ matrix.name }}
@@ -101,19 +91,6 @@ jobs:
           chmod +x mini-ci
           tar czvf "$RUNNER_TEMP/mini-ci-${VERSION}-${NAME}.tar.gz" mini-ci
           shasum -a 256 "$RUNNER_TEMP/mini-ci-${VERSION}-${NAME}.tar.gz" | tee "$RUNNER_TEMP/mini-ci-${VERSION}-${NAME}.tar.gz.sha256"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        env:
-          VERSION: ${{ github.ref_name }}
-          NAME: ${{ matrix.name }}
-        shell: pwsh
-        run: |
-          $dir = "target/${{ matrix.target }}/release"
-          $zip = Join-Path $env:RUNNER_TEMP "mini-ci-$($env:VERSION)-$($env:NAME).zip"
-          Compress-Archive -Path (Join-Path $dir "mini-ci.exe") -DestinationPath $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $(Split-Path $zip -Leaf)" | Out-File "$zip.sha256" -Encoding utf8
 
       - uses: actions/upload-artifact@v4
         with:
