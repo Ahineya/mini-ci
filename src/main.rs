@@ -54,11 +54,11 @@ async fn main() -> anyhow::Result<()> {
 
     let api = Router::new()
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/{id}", get(get_project))
+        .route("/projects/{id}", get(get_project).delete(delete_project))
         .route("/projects/{id}/sync", post(sync_project))
         .route("/projects/{id}/tasks", get(list_tasks))
         .route("/projects/{id}/runs", get(list_runs).post(run_task))
-        .route("/projects/{id}/runs/{run_id}", get(get_run))
+        .route("/projects/{id}/runs/{run_id}", get(get_run).delete(delete_run))
         .route("/projects/{id}/package", post(package_project))
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route(
@@ -188,21 +188,37 @@ async fn sync_project(
     };
 
     let dest = repo_dir(&st.data_root, &id);
-    if let Err(e) = git_ops::ensure_clone(&p.repo_url, &dest).await {
+    let stream = git_ops::sync_repository_stream(p.repo_url, dest, p.build_branch);
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn delete_project(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> impl IntoResponse {
+    if st.db.get_project(&id).ok().flatten().is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let repo = repo_dir(&st.data_root, &id);
+    let artifacts = st.data_root.join("artifacts").join(&id);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&artifacts);
+    if let Err(e) = st.db.delete_project(&id) {
         return (
-            StatusCode::BAD_REQUEST,
-            format!("clone: {e:#}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
         )
             .into_response();
     }
-    match git_ops::fetch_checkout(&dest, &p.build_branch).await {
-        Ok(log) => axum::Json(json!({ "ok": true, "log": log })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("checkout: {e:#}"),
-        )
-            .into_response(),
-    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn list_tasks(
@@ -256,19 +272,56 @@ async fn list_runs(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    log_offset: Option<usize>,
+}
+
 async fn get_run(
+    State(st): State<AppState>,
+    AxPath((project_id, run_id)): AxPath<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<LogQuery>,
+) -> impl IntoResponse {
+    match q.log_offset {
+        Some(offset) => match st.db.get_run_log_since(&run_id, offset) {
+            Ok(Some((r, total_len))) if r.project_id == project_id => {
+                Json(json!({
+                    "id": r.id,
+                    "project_id": r.project_id,
+                    "task_name": r.task_name,
+                    "status": r.status,
+                    "log": r.log,
+                    "log_offset": total_len,
+                    "started_at": r.started_at,
+                    "finished_at": r.finished_at,
+                }))
+                .into_response()
+            }
+            Ok(Some(_)) => StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        },
+        None => match st.db.get_run(&run_id) {
+            Ok(Some(r)) if r.project_id == project_id => Json(r).into_response(),
+            Ok(Some(_)) => StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        },
+    }
+}
+
+async fn delete_run(
     State(st): State<AppState>,
     AxPath((project_id, run_id)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
     match st.db.get_run(&run_id) {
-        Ok(Some(r)) if r.project_id == project_id => Json(r).into_response(),
-        Ok(Some(_)) => StatusCode::NOT_FOUND.into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{e:#}"),
-        )
-            .into_response(),
+        Ok(Some(r)) if r.project_id == project_id => {}
+        Ok(Some(_)) | Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+    match st.db.delete_run(&run_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
 
@@ -307,11 +360,11 @@ async fn run_task(
             .into_response();
     }
 
-    let script_path = repo.join(".microci").join(script_name);
+    let script_path = repo.join(".mini-ci").join(script_name);
     if !script_path.is_file() {
         return (
             StatusCode::BAD_REQUEST,
-            format!("Script not found: .microci/{script_name}"),
+            format!("Script not found: .mini-ci/{script_name}"),
         )
             .into_response();
     }

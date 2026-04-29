@@ -69,11 +69,40 @@ export function getProject(id: string) {
   return jsonFetch<Project>(`/projects/${encodeURIComponent(id)}`);
 }
 
-export function syncProject(id: string) {
-  return jsonFetch<{ ok: boolean; log: string }>(
-    `/projects/${encodeURIComponent(id)}/sync`,
-    { method: "POST" },
-  );
+/** Streams plain-text git output; calls onChunk as bytes arrive. */
+export async function syncProject(
+  id: string,
+  onChunk: (chunk: string) => void,
+): Promise<void> {
+  const res = await fetch(`${base}/projects/${encodeURIComponent(id)}/sync`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || res.statusText);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new Error("No response body");
+  }
+  const dec = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value?.length) {
+      onChunk(dec.decode(value, { stream: true }));
+    }
+  }
+}
+
+export async function deleteProject(id: string): Promise<void> {
+  const res = await fetch(`${base}/projects/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok && res.status !== 204) {
+    const t = await res.text();
+    throw new Error(t || res.statusText);
+  }
 }
 
 export function listTasks(id: string) {
@@ -96,10 +125,24 @@ export function runTask(id: string, task_name: string) {
   );
 }
 
-export function getRun(projectId: string, runId: string) {
-  return jsonFetch<Run>(
-    `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}`,
+export type RunDelta = Run & { log_offset: number };
+
+export function getRun(projectId: string, runId: string, logOffset?: number) {
+  const q = logOffset != null ? `?log_offset=${logOffset}` : "";
+  return jsonFetch<RunDelta>(
+    `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}${q}`,
   );
+}
+
+export async function deleteRun(projectId: string, runId: string): Promise<void> {
+  const res = await fetch(
+    `${base}/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 204) {
+    const t = await res.text();
+    throw new Error(t || res.statusText);
+  }
 }
 
 export function packageProject(id: string) {

@@ -94,6 +94,12 @@ impl Db {
         Ok(out)
     }
 
+    pub fn delete_project(&self, id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
@@ -180,6 +186,39 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Return run metadata with only the log content starting at byte `offset`.
+    /// Also returns `log_offset` = total log length so the caller can request the next chunk.
+    pub fn get_run_log_since(&self, id: &str, offset: usize) -> Result<Option<(RunRow, usize)>> {
+        let c = self.conn.lock().unwrap();
+        // SQLite substr is 1-indexed; length gives total byte count
+        let mut stmt = c.prepare(
+            "SELECT id, project_id, task_name, status, substr(log, ?2), length(log), started_at, finished_at FROM runs WHERE id = ?1",
+        )?;
+        stmt
+            .query_row(params![id, (offset + 1) as i64], |row| {
+                let log_tail: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+                let total_len: usize = row.get::<_, i64>(5)? as usize;
+                Ok((
+                    RunRow {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        task_name: row.get(2)?,
+                        status: row.get(3)?,
+                        log: log_tail,
+                        started_at: row
+                            .get::<_, Option<i64>>(6)?
+                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+                        finished_at: row
+                            .get::<_, Option<i64>>(7)?
+                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+                    },
+                    total_len,
+                ))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_runs(&self, project_id: &str) -> Result<Vec<RunRow>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
@@ -205,6 +244,12 @@ impl Db {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn delete_run(&self, id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM runs WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn insert_artifact(&self, a: &ArtifactRow) -> Result<()> {

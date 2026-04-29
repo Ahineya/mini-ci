@@ -1,8 +1,18 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+
+static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\r").unwrap()
+});
+
+fn strip_ansi(s: &str) -> String {
+    ANSI_RE.replace_all(s, "").into_owned()
+}
 
 pub async fn run_shell_script(
     script_path: &Path,
@@ -19,7 +29,7 @@ pub async fn run_shell_script(
         .context("spawn script")?;
 
     #[cfg(not(unix))]
-    anyhow::bail!("mini-ci only supports Unix shells for .microci tasks");
+    anyhow::bail!("mini-ci only supports Unix shells for .mini-ci tasks");
 
     let stdout = child.stdout.take().context("stdout")?;
     let stderr = child.stderr.take().context("stderr")?;
@@ -42,7 +52,8 @@ async fn pump_lines<R: AsyncRead + Unpin>(
 ) {
     let mut reader = BufReader::new(pipe).lines();
     while let Ok(Some(line)) = reader.next_line().await {
-        let msg = format!("[{label}] {line}\n");
+        let clean = strip_ansi(&line);
+        let msg = format!("[{label}] {clean}\n");
         let _ = tx.send(msg);
     }
 }
