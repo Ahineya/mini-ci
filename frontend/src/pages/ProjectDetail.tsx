@@ -92,19 +92,35 @@ export function ProjectDetail() {
     logStore.clear();
     setRepoSetupActive(true);
     const es = new EventSource(repoInitStreamUrl(id));
+    let streamDone = false;
+
+    const finish = () => {
+      if (streamDone) return;
+      streamDone = true;
+      es.close();
+      setRepoSetupActive(false);
+      setNeedsRepoClone(false);
+      void load();
+    };
 
     es.onmessage = (ev: MessageEvent) => {
       logStore.append(ev.data as string);
     };
 
-    es.addEventListener("end", () => {
+    es.addEventListener("end", finish);
+
+    // When the stream closes after a successful clone, many browsers fire `error` and the
+    // native EventSource would reconnect to the same URL — each hit sees `.git` and logs
+    // "repository already present" in a tight loop. Closing here disables auto-reconnect.
+    es.onerror = () => {
       es.close();
-      setRepoSetupActive(false);
-      setNeedsRepoClone(false);
-      void load();
-    });
+      if (!streamDone) {
+        finish();
+      }
+    };
 
     return () => {
+      streamDone = true;
       es.close();
       setRepoSetupActive(false);
     };

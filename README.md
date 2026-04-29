@@ -5,7 +5,7 @@ Single-binary CI server with a built-in web UI. You register Git repositories, p
 ## Requirements
 
 - **Git** on your `PATH` (clone and fetch).
-- **macOS or Linux** on the machine running `mini-ci`. Task scripts are executed with `/bin/sh` from the repository root ([`runner.rs`](src/runner.rs)).
+- **macOS or Linux** on the machine running `mini-ci`. Task scripts are executed with `/bin/sh` from the repository root (`[runner.rs](src/runner.rs)`).
 
 ## Install
 
@@ -21,7 +21,7 @@ The binary is `target/release/mini-ci` (and copied to `dist/mini-ci` by the scri
 
 ## Run
 
-By default the server listens on **`127.0.0.1:8787`** (localhost only).
+By default the server listens on `**127.0.0.1:8787**` (localhost only).
 
 ```bash
 mini-ci
@@ -31,11 +31,11 @@ mini-ci --dir /path/to/data
 
 **Data directory** (SQLite DB, cloned repos, artifact files):
 
-- **`--dir PATH`**, or
-- **`MINICI_DATA`**, or
-- **`~/.mini-ci`** if neither is set.
+- `**--dir PATH`**, or
+- `**MINICI_DATA**`, or
+- `**~/.mini-ci**` if neither is set.
 
-Open **http://127.0.0.1:8787** (or your chosen port) in a browser.
+Open **[http://127.0.0.1:8787](http://127.0.0.1:8787)** (or your chosen port) in a browser.
 
 Optional logging: `RUST_LOG=debug mini-ci` for more verbose traces.
 
@@ -43,18 +43,20 @@ Optional logging: `RUST_LOG=debug mini-ci` for more verbose traces.
 
 In the UI, create a **project** with:
 
-| Field | Meaning |
-|--------|--------|
-| **Repository URL** | Remote Git URL to clone (shallow clone, single branch). |
-| **Branch** | Branch to build (`git clone … --branch`). |
-| **Dist path** | Path **relative to the repo root** where your build writes output (e.g. `dist` or `frontend/dist`). After a **successful** task (exit code `0`), if this path exists **and is a directory**, mini-ci zips it and stores it as an **artifact**. |
-| **Name** | Display name only. |
+
+| Field              | Meaning                                                                                                                                                                                                                                        |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Repository URL** | Remote Git URL to clone (shallow clone, single branch).                                                                                                                                                                                        |
+| **Branch**         | Branch to build (`git clone … --branch`).                                                                                                                                                                                                      |
+| **Dist path**      | Path **relative to the repo root** where your build writes output (e.g. `dist` or `frontend/dist`). After a **successful** task (exit code `0`), if this path exists **and is a directory**, mini-ci zips it and stores it as an **artifact**. |
+| **Name**           | Display name only.                                                                                                                                                                                                                             |
+
 
 The server keeps one clone per project under `<data>/repos/<project-id>/`.
 
 ## Tasks (`.mini-ci` scripts)
 
-Tasks are **executable shell scripts** named `*.sh` in a **`.mini-ci`** directory at the **root of the repository**. The file name (e.g. `build.sh`) is the task name shown in the UI.
+Tasks are **executable shell scripts** named `*.sh` in a `**.mini-ci`** directory at the **root of the repository**. The file name (e.g. `build.sh`) is the task name shown in the UI.
 
 Example layout:
 
@@ -70,7 +72,7 @@ your-repo/
 Each run:
 
 1. Updates the repo (clone or fetch for the configured branch).
-2. Runs **`.mini-ci/<task>.sh`** with working directory = repo root and `/bin/sh`.
+2. Runs `**.mini-ci/<task>.sh**` with working directory = repo root and `/bin/sh`.
 3. Streams **stdout** / **stderr** into the run log.
 4. If the script exits with **0**, tries to zip the project’s **dist path** (if that path is a directory) and records an artifact.
 
@@ -82,7 +84,7 @@ Artifacts are ZIP files stored under `<data>/artifacts/<project-id>/`. You can d
 
 ## Development
 
-- **Rust**: Axum, SQLite (`bundled`), Tokio ([`src/`](src/)).
-- **UI**: [`frontend/`](frontend/) (Vite + React). `cargo build` runs [`build.rs`](build.rs), which invokes `npm ci` and `npm run build` in `frontend/` so the production bundle is embedded in the binary.
+- **Rust**: Axum, SQLite (`bundled`), Tokio (`[src/](src/)`).
+- **UI**: `[frontend/](frontend/)` (Vite + React). `cargo build` runs `[build.rs](build.rs)`, which invokes `npm ci` and `npm run build` in `frontend/` so the production bundle is embedded in the binary.
 
 After changing code, rebuild with `.mini-ci/build.sh` or `cargo build --release`.
