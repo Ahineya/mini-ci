@@ -7,11 +7,13 @@ mod runner;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use clap::Parser;
 use async_stream::stream;
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Query, State};
@@ -28,6 +30,19 @@ use models::{
 use serde_json::json;
 use tokio::sync::{mpsc, Notify, RwLock};
 use uuid::Uuid;
+
+#[derive(Parser, Debug)]
+#[command(name = "mini-ci")]
+#[command(about = "Single-binary mini CI server with web UI")]
+struct Cli {
+    /// TCP port to listen on (127.0.0.1)
+    #[arg(long, default_value_t = 8787)]
+    port: u16,
+
+    /// Data directory for SQLite, cloned repos, and artifacts (default: ~/.mini-ci, or MINICI_DATA)
+    #[arg(long, value_name = "PATH")]
+    dir: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -46,17 +61,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let data_root = std::env::var("MINICI_DATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".mini-ci")
-        });
+    let Cli { port, dir } = Cli::parse();
+
+    let data_root = resolve_data_root(dir);
     std::fs::create_dir_all(&data_root).context("create data root")?;
 
     let db_path = data_root.join("mini-ci.sqlite");
     let db = Arc::new(db::Db::open(&db_path).context("open database")?);
+    tracing::info!(
+        data_root = %data_root.display(),
+        "mini-ci data directory"
+    );
+
     let state = AppState {
         db,
         data_root,
@@ -84,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
         .fallback(static_handler)
         .with_state(state);
 
-    let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
-    tracing::info!("mini-ci listening on http://{addr}");
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    tracing::info!("mini-ci listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -125,6 +141,19 @@ fn not_found() -> Response {
         .status(StatusCode::NOT_FOUND)
         .body(Body::from("not found"))
         .unwrap()
+}
+
+fn resolve_data_root(cli_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = cli_dir {
+        return p;
+    }
+    std::env::var("MINICI_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mini-ci")
+        })
 }
 
 fn repo_dir(data_root: &Path, project_id: &str) -> PathBuf {
