@@ -21,21 +21,23 @@ The binary is `target/release/mini-ci` (and copied to `dist/mini-ci` by the scri
 
 ## Run
 
-By default the server listens on `**127.0.0.1:8787**` (localhost only).
+By default the server listens on **127.0.0.1:8787** (localhost only). To reach it from other machines on the network, bind to all interfaces and use the host’s IP in the browser (ensure the OS firewall allows incoming TCP on the port):
 
 ```bash
 mini-ci
 mini-ci --port 9000
+mini-ci --host 0.0.0.0
+mini-ci --host 0.0.0.0 --port 8787
 mini-ci --dir /path/to/data
 ```
 
 **Data directory** (SQLite DB, cloned repos, artifact files):
 
-- `**--dir PATH`**, or
-- `**MINICI_DATA**`, or
-- `**~/.mini-ci**` if neither is set.
+- **`--dir PATH`**, or
+- **`MINICI_DATA`**, or
+- **`~/.mini-ci`** if neither is set.
 
-Open **[http://127.0.0.1:8787](http://127.0.0.1:8787)** (or your chosen port) in a browser.
+Open **http://127.0.0.1:8787** (or your chosen host and port) in a browser.
 
 Optional logging: `RUST_LOG=debug mini-ci` for more verbose traces.
 

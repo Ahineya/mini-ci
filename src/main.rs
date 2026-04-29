@@ -7,7 +7,7 @@ mod runner;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::Json;
 use axum::Router;
 use embed::Assets;
@@ -35,7 +35,10 @@ use uuid::Uuid;
 #[command(name = "mini-ci")]
 #[command(about = "Single-binary mini CI server with web UI")]
 struct Cli {
-    /// TCP port to listen on (127.0.0.1)
+    /// Listen address (localhost only by default; use 0.0.0.0 for all interfaces / LAN access)
+    #[arg(long, default_value = "127.0.0.1")]
+    host: IpAddr,
+
     #[arg(long, default_value_t = 8787)]
     port: u16,
 
@@ -61,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let Cli { port, dir } = Cli::parse();
+    let Cli { host, port, dir } = Cli::parse();
 
     let data_root = resolve_data_root(dir);
     std::fs::create_dir_all(&data_root).context("create data root")?;
@@ -95,14 +98,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/artifacts/{artifact_id}/download",
             get(download_artifact),
-        );
+        )
+        .route("/artifacts/{artifact_id}", delete(delete_artifact_entry));
 
     let app = Router::new()
         .nest("/api", api)
         .fallback(static_handler)
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::new(host, port);
     tracing::info!("mini-ci listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -790,4 +794,46 @@ async fn download_artifact(
         )
             .into_response(),
     }
+}
+
+async fn delete_artifact_entry(
+    State(st): State<AppState>,
+    AxPath(artifact_id): AxPath<String>,
+) -> impl IntoResponse {
+    let row = match st.db.get_artifact(&artifact_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}"),
+            )
+                .into_response()
+        }
+    };
+
+    if let Err(e) = st.db.delete_artifact(&artifact_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
+        )
+            .into_response();
+    }
+
+    let path = st
+        .data_root
+        .join("artifacts")
+        .join(&row.project_id)
+        .join(&row.filename);
+    if path.is_file() {
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to remove artifact file after DB delete"
+            );
+        }
+    }
+
+    StatusCode::NO_CONTENT.into_response()
 }

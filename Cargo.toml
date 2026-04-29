@@ -1,6 +1,6 @@
 [package]
 name = "mini-ci"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Single-binary mini CI server with web UI"
 build = "build.rs"

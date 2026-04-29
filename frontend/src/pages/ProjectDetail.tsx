@@ -4,6 +4,7 @@ import { LogStore } from "../LogStore";
 import { VirtualLog } from "../VirtualLog";
 import {
   artifactDownloadUrl,
+  deleteArtifact,
   deleteProject,
   deleteRun,
   getProject,
@@ -60,6 +61,16 @@ export function ProjectDetail() {
 
   const logOffsetRef = useRef<number>(0);
   const logStore = useMemo(() => new LogStore(), []);
+
+  /** Newest first (matches API); tie-break for stable order. */
+  const artifactsSorted = useMemo(() => {
+    return [...artifacts].sort((a, b) => {
+      const tb = new Date(b.created_at).getTime();
+      const ta = new Date(a.created_at).getTime();
+      if (tb !== ta) return tb - ta;
+      return b.id.localeCompare(a.id);
+    });
+  }, [artifacts]);
 
   /* ---- data loading ---- */
   const load = useCallback(async () => {
@@ -242,6 +253,18 @@ export function ProjectDetail() {
     }
   }
 
+  async function onDeleteArtifact(e: React.MouseEvent, artifactId: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!window.confirm("Delete this artifact zip? This cannot be undone.")) return;
+    try {
+      await deleteArtifact(artifactId);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   /* ---------------------------------------------------------------- */
   /*  Render                                                           */
   /* ---------------------------------------------------------------- */
@@ -413,22 +436,43 @@ export function ProjectDetail() {
                   </p>
                 ) : (
                   <div className="space-y-0.5">
-                    {artifacts.map((a) => (
-                      <a
+                    {artifactsSorted.map((a, i) => (
+                      <div
                         key={a.id}
-                        href={artifactDownloadUrl(a.id)}
-                        className="flex items-center justify-between rounded-md px-2.5 py-2 transition hover:bg-surface-2"
+                        className="group/art flex items-stretch gap-0.5 rounded-md transition hover:bg-surface-2"
                       >
-                        <div className="min-w-0">
-                          <div className="truncate font-mono text-xs text-text-primary">{a.filename}</div>
-                          <div className="text-[10px] text-text-tertiary">
-                            {(a.bytes / 1024).toFixed(1)} KB
+                        <a
+                          href={artifactDownloadUrl(a.id)}
+                          className="flex min-w-0 flex-1 items-center justify-between px-2.5 py-2"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex min-w-0 items-center gap-2">
+                              {i === 0 && (
+                                <span className="shrink-0 rounded bg-accent-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent">
+                                  Latest
+                                </span>
+                              )}
+                              <span className="truncate font-mono text-xs text-text-primary">{a.filename}</span>
+                            </div>
+                            <div className="text-[10px] text-text-tertiary">
+                              {(a.bytes / 1024).toFixed(1)} KB
+                            </div>
                           </div>
-                        </div>
-                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="shrink-0 text-text-tertiary">
-                          <path d="M7 2v7.5M3.5 7L7 10.5 10.5 7M2.5 12.5h9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      </a>
+                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="ml-2 shrink-0 text-text-tertiary">
+                            <path d="M7 2v7.5M3.5 7L7 10.5 10.5 7M2.5 12.5h9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </a>
+                        <button
+                          type="button"
+                          onClick={(e) => void onDeleteArtifact(e, a.id)}
+                          className="shrink-0 rounded-md px-2 text-text-tertiary opacity-0 transition hover:bg-danger-muted hover:text-danger group-hover/art:opacity-100"
+                          title="Delete artifact"
+                        >
+                          <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
+                            <path d="M3.5 3.5L10.5 10.5M10.5 3.5L3.5 10.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                          </svg>
+                        </button>
+                      </div>
                     ))}
                   </div>
                 )}

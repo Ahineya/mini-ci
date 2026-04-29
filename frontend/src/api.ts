@@ -156,3 +156,14 @@ export function listArtifacts(id: string) {
 export function artifactDownloadUrl(artifactId: string) {
   return `${base}/artifacts/${encodeURIComponent(artifactId)}/download`;
 }
+
+export async function deleteArtifact(artifactId: string): Promise<void> {
+  const res = await fetch(
+    `${base}/artifacts/${encodeURIComponent(artifactId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 204) {
+    const t = await res.text();
+    throw new Error(t || res.statusText);
+  }
+}

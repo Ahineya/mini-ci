@@ -340,4 +340,10 @@ impl Db {
             .optional()
             .map_err(Into::into)
     }
+
+    pub fn delete_artifact(&self, id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM artifacts WHERE id = ?1", params![id])?;
+        Ok(())
+    }
 }
