@@ -12,5 +12,9 @@ cd ..
 echo "==> Building mini-ci (release)"
 cargo build --release
 
-echo "==> Done! Binary at target/release/mini-ci"
-ls -lh target/release/mini-ci
+echo "==> Copying release binary to dist/"
+mkdir -p dist
+cp -f target/release/mini-ci dist/mini-ci
+
+echo "==> Done!"
+ls -lh target/release/mini-ci dist/mini-ci
