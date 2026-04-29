@@ -13,6 +13,8 @@ export type Run = {
   task_name: string;
   status: string;
   log: string;
+  /** Total log length in API offset units (SQLite characters); required for incremental polling. */
+  log_offset?: number;
   started_at: string | null;
   finished_at: string | null;
 };
@@ -101,11 +103,24 @@ export function runTask(id: string, task_name: string) {
 
 export type RunDelta = Run & { log_offset: number };
 
-export function getRun(projectId: string, runId: string, logOffset?: number) {
-  const q = logOffset != null ? `?log_offset=${logOffset}` : "";
+export function getRun(
+  projectId: string,
+  runId: string,
+  logOffset?: number,
+  options?: { omitLog?: boolean },
+) {
+  const params = new URLSearchParams();
+  if (logOffset != null) params.set("log_offset", String(logOffset));
+  if (options?.omitLog) params.set("omit_log", "true");
+  const q = params.toString();
   return jsonFetch<RunDelta>(
-    `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}${q}`,
+    `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}${q ? `?${q}` : ""}`,
   );
+}
+
+/** SSE URL — live log bytes (see GET …/log/stream). */
+export function runLogStreamUrl(projectId: string, runId: string, from = 0) {
+  return `${base}/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}/log/stream?from=${from}`;
 }
 
 export async function deleteRun(projectId: string, runId: string): Promise<void> {
@@ -117,13 +132,6 @@ export async function deleteRun(projectId: string, runId: string): Promise<void>
     const t = await res.text();
     throw new Error(t || res.statusText);
   }
-}
-
-export function packageProject(id: string) {
-  return jsonFetch<{ artifact_id: string; filename: string; bytes: number }>(
-    `/projects/${encodeURIComponent(id)}/package`,
-    { method: "POST" },
-  );
 }
 
 export function listArtifacts(id: string) {

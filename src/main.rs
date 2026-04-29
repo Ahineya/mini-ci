@@ -5,15 +5,20 @@ mod models;
 mod package_zip;
 mod runner;
 
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use async_stream::stream;
 use axum::body::Body;
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use embed::Assets;
@@ -21,13 +26,15 @@ use models::{
     ArtifactRow, CreateProject, Project, RunRow, RunTaskBody, TaskInfo,
 };
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify, RwLock};
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<db::Db>,
     data_root: PathBuf,
+    /// Wake SSE log streams when a run appends to its log (removed when the run finishes).
+    run_notifies: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
 }
 
 #[tokio::main]
@@ -50,15 +57,22 @@ async fn main() -> anyhow::Result<()> {
 
     let db_path = data_root.join("mini-ci.sqlite");
     let db = Arc::new(db::Db::open(&db_path).context("open database")?);
-    let state = AppState { db, data_root };
+    let state = AppState {
+        db,
+        data_root,
+        run_notifies: Arc::new(RwLock::new(HashMap::new())),
+    };
 
     let api = Router::new()
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).delete(delete_project))
         .route("/projects/{id}/tasks", get(list_tasks))
         .route("/projects/{id}/runs", get(list_runs).post(run_task))
+        .route(
+            "/projects/{id}/runs/{run_id}/log/stream",
+            get(run_log_sse),
+        )
         .route("/projects/{id}/runs/{run_id}", get(get_run).delete(delete_run))
-        .route("/projects/{id}/package", post(package_project))
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route(
             "/artifacts/{artifact_id}/download",
@@ -115,6 +129,47 @@ fn not_found() -> Response {
 
 fn repo_dir(data_root: &Path, project_id: &str) -> PathBuf {
     data_root.join("repos").join(project_id)
+}
+
+/// Zip `project.dist_path` under the repo clone and insert an artifact row after a successful run.
+/// Returns `Ok(None)` if that path is not a directory (build did not produce output there).
+/// Zipping runs in `spawn_blocking` so large trees don't stall the async runtime (SSE still wakes from other notifies).
+async fn try_package_dist(
+    db: &db::Db,
+    data_root: &Path,
+    project: &Project,
+    project_id: &str,
+) -> anyhow::Result<Option<(String, u64, String)>> {
+    let repo = repo_dir(data_root, project_id);
+    let dist = repo.join(&project.dist_path);
+    if !dist.is_dir() {
+        return Ok(None);
+    }
+
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("{}-{}.zip", project.name.replace(' ', "-"), ts);
+    let rel_storage = format!("{project_id}/{filename}");
+    let out_path = package_zip::artifact_paths(data_root, project_id, &filename);
+
+    let dist_blocking = dist.clone();
+    let out_blocking = out_path.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        package_zip::zip_directory(&dist_blocking, &out_blocking)
+    })
+    .await
+    .context("zip task join")??;
+
+    let aid = Uuid::new_v4().to_string();
+    let row = ArtifactRow {
+        id: aid.clone(),
+        project_id: project_id.to_string(),
+        filename: filename.clone(),
+        rel_path: rel_storage,
+        bytes,
+        created_at: chrono::Utc::now(),
+    };
+    db.insert_artifact(&row).context("insert artifact")?;
+    Ok(Some((filename, bytes, aid)))
 }
 
 async fn list_projects(State(st): State<AppState>) -> impl IntoResponse {
@@ -255,6 +310,22 @@ async fn list_runs(
 #[derive(serde::Deserialize)]
 struct LogQuery {
     log_offset: Option<usize>,
+    omit_log: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct SseFromQuery {
+    from: Option<usize>,
+}
+
+async fn finalize_run_notifier(
+    notify: &Notify,
+    run_notifies: &RwLock<HashMap<String, Arc<Notify>>>,
+    run_id: &str,
+) {
+    notify.notify_waiters();
+    let mut m = run_notifies.write().await;
+    m.remove(run_id);
 }
 
 async fn get_run(
@@ -262,6 +333,23 @@ async fn get_run(
     AxPath((project_id, run_id)): AxPath<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<LogQuery>,
 ) -> impl IntoResponse {
+    if q.omit_log == Some(true) {
+        return match st.db.get_run_meta(&run_id) {
+            Ok(Some(m)) if m.project_id == project_id => Json(json!({
+                "id": m.id,
+                "project_id": m.project_id,
+                "task_name": m.task_name,
+                "status": m.status,
+                "log": "",
+                "log_offset": m.log_char_len,
+                "started_at": m.started_at,
+                "finished_at": m.finished_at,
+            }))
+            .into_response(),
+            Ok(Some(_)) | Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        };
+    }
     match q.log_offset {
         Some(offset) => match st.db.get_run_log_since(&run_id, offset) {
             Ok(Some((r, total_len))) if r.project_id == project_id => {
@@ -282,7 +370,17 @@ async fn get_run(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
         },
         None => match st.db.get_run(&run_id) {
-            Ok(Some(r)) if r.project_id == project_id => Json(r).into_response(),
+            Ok(Some((r, log_offset))) if r.project_id == project_id => Json(json!({
+                "id": r.id,
+                "project_id": r.project_id,
+                "task_name": r.task_name,
+                "status": r.status,
+                "log": r.log,
+                "log_offset": log_offset,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+            }))
+            .into_response(),
             Ok(Some(_)) => StatusCode::NOT_FOUND.into_response(),
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
@@ -295,7 +393,7 @@ async fn delete_run(
     AxPath((project_id, run_id)): AxPath<(String, String)>,
 ) -> impl IntoResponse {
     match st.db.get_run(&run_id) {
-        Ok(Some(r)) if r.project_id == project_id => {}
+        Ok(Some((r, _))) if r.project_id == project_id => {}
         Ok(Some(_)) | Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -303,6 +401,88 @@ async fn delete_run(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
+}
+
+/// Live run log via SSE: one `data` event per DB delta (each wake / poll), not per 256KiB slice —
+/// same LAN / localhost CI shouldn’t simulate slow streaming over tiny frames.
+async fn run_log_sse(
+    State(st): State<AppState>,
+    AxPath((project_id, run_id)): AxPath<(String, String)>,
+    Query(q): Query<SseFromQuery>,
+) -> impl IntoResponse {
+    let from = q.from.unwrap_or(0);
+    let db = st.db.clone();
+    let run_notifies = st.run_notifies.clone();
+
+    let stream = stream! {
+        let mut offset = from;
+        // `done` once when row becomes non-running (script exit); packaging log comes on later wakes.
+        let mut sent_done = false;
+        loop {
+            let parsed = match db.get_run_log_since(&run_id, offset) {
+                Ok(Some((r, total_len))) => {
+                    if r.project_id != project_id {
+                        yield Ok::<Event, Infallible>(Event::default().event("error").data("run not found"));
+                        break;
+                    }
+                    (r, total_len)
+                }
+                Ok(None) => {
+                    yield Ok::<Event, Infallible>(Event::default().event("error").data("run not found"));
+                    break;
+                }
+                Err(e) => {
+                    yield Ok::<Event, Infallible>(Event::default().event("error").data(format!("{e:#}")));
+                    break;
+                }
+            };
+            let (r, total_len) = parsed;
+            let terminal = r.status != "running";
+
+            if terminal && !sent_done {
+                let payload = json!({
+                    "id": r.id,
+                    "project_id": r.project_id,
+                    "task_name": r.task_name,
+                    "status": r.status,
+                    "log_offset": total_len,
+                    "started_at": r.started_at,
+                    "finished_at": r.finished_at,
+                });
+                yield Ok::<Event, Infallible>(Event::default().event("done").data(payload.to_string()));
+                sent_done = true;
+            }
+
+            let log_empty = r.log.is_empty();
+            if !log_empty {
+                yield Ok::<Event, Infallible>(Event::default().data(r.log));
+            }
+            offset = total_len;
+
+            // Close only when terminal + done was sent + no bytes left in this delta (log drained for now).
+            // More log may arrive from packaging — keep the connection open until then.
+            if terminal && sent_done && log_empty {
+                yield Ok::<Event, Infallible>(Event::default().event("end").data(""));
+                break;
+            }
+
+            let n = run_notifies.read().await.get(&run_id).cloned();
+            match n {
+                Some(ref notify) => {
+                    notify.notified().await;
+                }
+                None => {
+                    if terminal && sent_done {
+                        yield Ok::<Event, Infallible>(Event::default().event("end").data(""));
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 
 async fn run_task(
@@ -351,16 +531,28 @@ async fn run_task(
             .into_response();
     }
 
+    let notify = Arc::new(Notify::new());
+    {
+        let mut map = st.run_notifies.write().await;
+        map.insert(run_id.clone(), notify.clone());
+    }
+
     let db = st.db.clone();
+    let data_root = st.data_root.clone();
     let repo = repo_dir(&st.data_root, &project_id);
+    let run_notifies = st.run_notifies.clone();
+    let notify_bg = notify.clone();
 
     tokio::spawn(async move {
+        let notify = notify_bg;
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let db_log = db.clone();
         let rid = run_id.clone();
+        let n = notify.clone();
         let log_writer = tokio::spawn(async move {
             while let Some(chunk) = rx.recv().await {
                 let _ = db_log.append_run_log(&rid, &chunk);
+                n.notify_waiters();
             }
         });
 
@@ -376,7 +568,9 @@ async fn run_task(
             let _ = tx.send(format!("ERROR: repository update failed: {e:#}\n"));
             drop(tx);
             let _ = log_writer.await;
-            let _ = db.set_run_status(&run_id, "failed", Some(chrono::Utc::now()));
+            let fin = chrono::Utc::now();
+            let _ = db.set_run_status(&run_id, "failed", Some(fin));
+            finalize_run_notifier(&notify, &run_notifies, &run_id).await;
             return;
         }
 
@@ -386,7 +580,9 @@ async fn run_task(
             let _ = tx.send(format!("ERROR: script not found: .mini-ci/{script_name}\n"));
             drop(tx);
             let _ = log_writer.await;
-            let _ = db.set_run_status(&run_id, "failed", Some(chrono::Utc::now()));
+            let fin = chrono::Utc::now();
+            let _ = db.set_run_status(&run_id, "failed", Some(fin));
+            finalize_run_notifier(&notify, &run_notifies, &run_id).await;
             return;
         }
 
@@ -400,82 +596,54 @@ async fn run_task(
             Err(e) => format!("\n--- runner error: {e:#} ---\n"),
         };
         let _ = db.append_run_log(&run_id, &exit_msg);
+        notify.notify_waiters();
 
-        let status = match run_result {
+        // Terminal status as soon as the .sh exits — NOT after packaging. SSE `done` keys off this row.
+        let status = match &run_result {
             Ok(0) => "success",
             Ok(_) => "failed",
             Err(_) => "failed",
         };
         let finished = chrono::Utc::now();
         let _ = db.set_run_status(&run_id, status, Some(finished));
+        notify.notify_waiters();
+
+        if matches!(&run_result, Ok(0)) {
+            let _ = db.append_run_log(&run_id, "\n=== packaging dist… ===\n");
+            notify.notify_waiters();
+
+            match try_package_dist(&db, &data_root, &project, &project_id).await {
+                Ok(Some((name, bytes, _))) => {
+                    let _ = db.append_run_log(
+                        &run_id,
+                        &format!("\n=== artifact: {name} ({bytes} bytes) ===\n"),
+                    );
+                    notify.notify_waiters();
+                }
+                Ok(None) => {
+                    let _ = db.append_run_log(
+                        &run_id,
+                        &format!(
+                            "\n=== artifact skipped: `{}` is not a directory (build must create it under the project dist path) ===\n",
+                            project.dist_path
+                        ),
+                    );
+                    notify.notify_waiters();
+                }
+                Err(e) => {
+                    let _ = db.append_run_log(
+                        &run_id,
+                        &format!("\n=== artifact zip failed: {e:#} ===\n"),
+                    );
+                    notify.notify_waiters();
+                }
+            }
+        }
+
+        finalize_run_notifier(&notify, &run_notifies, &run_id).await;
     });
 
     Json(json!({ "run_id": run_id_response })).into_response()
-}
-
-async fn package_project(
-    State(st): State<AppState>,
-    AxPath(project_id): AxPath<String>,
-) -> impl IntoResponse {
-    let p = match st.db.get_project(&project_id) {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{e:#}"),
-            )
-                .into_response()
-        }
-    };
-
-    let repo = repo_dir(&st.data_root, &project_id);
-    let dist = repo.join(&p.dist_path);
-    if !dist.is_dir() {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("Dist directory does not exist: {}", dist.display()),
-        )
-            .into_response();
-    }
-
-    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("{}-{}.zip", p.name.replace(' ', "-"), ts);
-    let rel_storage = format!("{project_id}/{filename}");
-    let out_path =
-        package_zip::artifact_paths(&st.data_root, &project_id, &filename);
-
-    match package_zip::zip_directory(&dist, &out_path) {
-        Ok(bytes) => {
-            let aid = Uuid::new_v4().to_string();
-            let row = ArtifactRow {
-                id: aid.clone(),
-                project_id: project_id.clone(),
-                filename: filename.clone(),
-                rel_path: rel_storage,
-                bytes,
-                created_at: chrono::Utc::now(),
-            };
-            if let Err(e) = st.db.insert_artifact(&row) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{e:#}"),
-                )
-                    .into_response();
-            }
-            Json(json!({
-                "artifact_id": aid,
-                "filename": filename,
-                "bytes": bytes,
-            }))
-            .into_response()
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("zip: {e:#}"),
-        )
-            .into_response(),
-    }
 }
 
 async fn list_artifacts(

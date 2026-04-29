@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::models::{ArtifactRow, Project, RunRow};
+use crate::models::{ArtifactRow, Project, RunMeta, RunRow};
 
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -161,19 +161,20 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
+    /// Full run row plus `LENGTH(log)` (SQLite character count — must match `get_run_log_since` offsets).
+    pub fn get_run_meta(&self, id: &str) -> Result<Option<RunMeta>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT id, project_id, task_name, status, log, started_at, finished_at FROM runs WHERE id = ?1",
+            "SELECT id, project_id, task_name, status, length(log), started_at, finished_at FROM runs WHERE id = ?1",
         )?;
         stmt
             .query_row(params![id], |row| {
-                Ok(RunRow {
+                Ok(RunMeta {
                     id: row.get(0)?,
                     project_id: row.get(1)?,
                     task_name: row.get(2)?,
                     status: row.get(3)?,
-                    log: row.get(4)?,
+                    log_char_len: row.get::<_, i64>(4)? as usize,
                     started_at: row
                         .get::<_, Option<i64>>(5)?
                         .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
@@ -181,6 +182,34 @@ impl Db {
                         .get::<_, Option<i64>>(6)?
                         .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
                 })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_run(&self, id: &str) -> Result<Option<(RunRow, usize)>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id, project_id, task_name, status, log, length(log), started_at, finished_at FROM runs WHERE id = ?1",
+        )?;
+        stmt
+            .query_row(params![id], |row| {
+                Ok((
+                    RunRow {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        task_name: row.get(2)?,
+                        status: row.get(3)?,
+                        log: row.get(4)?,
+                        started_at: row
+                            .get::<_, Option<i64>>(6)?
+                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+                        finished_at: row
+                            .get::<_, Option<i64>>(7)?
+                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+                    },
+                    row.get::<_, i64>(5)? as usize,
+                ))
             })
             .optional()
             .map_err(Into::into)

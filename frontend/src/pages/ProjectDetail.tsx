@@ -11,7 +11,7 @@ import {
   listArtifacts,
   listRuns,
   listTasks,
-  packageProject,
+  runLogStreamUrl,
   runTask,
   type Artifact,
   type Project,
@@ -75,27 +75,47 @@ export function ProjectDetail() {
     void load();
   }, [load]);
 
-  /* ---- polling ---- */
+  /* ---- live log: SSE (server wakes on each append; no 400ms polling) ---- */
   useEffect(() => {
     if (!pollRunId || !id) return;
-    const t = setInterval(async () => {
+    const es = new EventSource(runLogStreamUrl(id, pollRunId, 0));
+
+    es.onmessage = (ev: MessageEvent) => {
+      logStore.append(ev.data as string);
+    };
+
+    es.addEventListener("done", (ev: Event) => {
+      const me = ev as MessageEvent<string>;
       try {
-        const r = await getRun(id, pollRunId, logOffsetRef.current);
-        logStore.append(r.log);
-        logOffsetRef.current = r.log_offset;
-        setActiveRun((prev) =>
-          prev && prev.id === r.id ? { ...prev, status: r.status, finished_at: r.finished_at } : prev,
-        );
-        if (r.status !== "running") {
-          setPollRunId(null);
-          void load();
+        const d = JSON.parse(me.data) as Run;
+        setActiveRun({
+          id: d.id,
+          project_id: d.project_id,
+          task_name: d.task_name,
+          status: d.status,
+          log: "",
+          started_at: d.started_at,
+          finished_at: d.finished_at,
+        });
+        if (d.status === "success") {
+          setTab("artifacts");
         }
+        void load();
       } catch {
-        setPollRunId(null);
+        /* ignore malformed */
       }
-    }, 400);
-    return () => clearInterval(t);
-  }, [pollRunId, id, load, logStore]);
+    });
+
+    es.addEventListener("end", () => {
+      es.close();
+      setPollRunId(null);
+      void load();
+    });
+
+    return () => {
+      es.close();
+    };
+  }, [pollRunId, id, logStore, load]);
 
   if (!id) return <p className="p-8 text-text-tertiary">Missing project id.</p>;
   const projectId = id;
@@ -120,11 +140,17 @@ export function ProjectDetail() {
       const { run_id } = await runTask(projectId, taskName);
       logOffsetRef.current = 0;
       logStore.clear();
+      const started = new Date().toISOString();
+      setActiveRun({
+        id: run_id,
+        project_id: projectId,
+        task_name: taskName,
+        status: "running",
+        log: "",
+        started_at: started,
+        finished_at: null,
+      });
       setPollRunId(run_id);
-      const initial = await getRun(projectId, run_id);
-      logStore.append(initial.log);
-      logOffsetRef.current = initial.log_offset;
-      setActiveRun(initial);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -134,13 +160,18 @@ export function ProjectDetail() {
   async function selectRun(runId: string) {
     setPollRunId(null);
     try {
+      const meta = await getRun(projectId, runId, undefined, { omitLog: true });
+      if (meta.status === "running") {
+        logStore.clear();
+        logOffsetRef.current = meta.log_offset ?? 0;
+        setActiveRun({ ...meta, log: "" });
+        setPollRunId(runId);
+        return;
+      }
       const full = await getRun(projectId, runId);
       logStore.load(full.log);
-      logOffsetRef.current = full.log_offset;
+      logOffsetRef.current = full.log_offset ?? [...full.log].length;
       setActiveRun(full);
-      if (full.status === "running") {
-        setPollRunId(runId);
-      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -157,17 +188,6 @@ export function ProjectDetail() {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  async function onPackage() {
-    setError(null);
-    try {
-      await packageProject(projectId);
-      setTab("artifacts");
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -205,18 +225,6 @@ export function ProjectDetail() {
             )}
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            <button
-              type="button"
-              onClick={() => void onPackage()}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-surface-0 transition hover:brightness-110"
-            >
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                <rect x="2" y="3" width="10" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
-                <path d="M5 3V1.5h4V3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-                <path d="M5.5 7h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-              </svg>
-              Package
-            </button>
             <button
               type="button"
               onClick={() => void onRemoveProject()}
@@ -350,7 +358,7 @@ export function ProjectDetail() {
               <div className="p-2">
                 {artifacts.length === 0 ? (
                   <p className="px-2 py-4 text-xs text-text-tertiary">
-                    No artifacts. Use Package to create one.
+                    No artifacts yet. A successful task run creates a zip of the dist folder (see run log).
                   </p>
                 ) : (
                   <div className="space-y-0.5">

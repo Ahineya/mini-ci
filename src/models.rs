@@ -29,6 +29,18 @@ pub struct RunRow {
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Run fields without the log body (`length(log)` matches incremental `log_offset` units).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunMeta {
+    pub id: String,
+    pub project_id: String,
+    pub task_name: String,
+    pub status: String,
+    pub log_char_len: usize,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RunTaskBody {
     pub task_name: String,
